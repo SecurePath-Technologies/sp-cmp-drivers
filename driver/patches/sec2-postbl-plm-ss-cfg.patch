@@ -66,7 +66,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
  
      {
          // If the new FB layout requires a scrubber ucode to scrub additional space, prepare it now
-@@ -4821,6 +4857,143 @@
+@@ -4821,6 +4857,148 @@
      // Setup arguments for bootstrapping GSP
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPrepareForBootstrap_HAL(pGpu, pKernelGsp, KGSP_BOOT_MODE_NORMAL));
  
@@ -89,6 +89,11 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +            { 0x008200d8U, 0xffffffffU, "RECONFIG_PLM" },
 +            { 0x0000c840U, 0xffffffffU, "PJTAG_PLM" },
 +            { 0x0000c848U, 0xffffffffU, "PJTAG_SEC_PLM" },
++            // FBPA memory-PLL PLMs (asm64-hooligan/cmpunlocker@mem_overclock): opens the unicast
++            // FBPA PLL window (0x903c7c/0x903c98) to host writes for 170tune hbm_mclk. 2026-11-05.
++            { 0x009a3c7cU, 0xffffffffU, "FBPA_PLL0" },
++            { 0x009a3c80U, 0xffffffffU, "FBPA_PLL1" },
++            { 0x009a3c84U, 0xffffffffU, "FBPA_PLL2" },
 +        };
 +
 +        NvU32 wpr2Lo = GPU_REG_RD32(pGpu, 0x001fa824U);
@@ -97,7 +102,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +                  "SEC2_DEBUG: saved WPR2 lo=0x%08x hi=0x%08x\n",
 +                  wpr2Lo, wpr2Hi);
 +
-+        for (plmIdx = 0; plmIdx < 12; plmIdx++)
++        for (plmIdx = 0; plmIdx < NV_ARRAY_ELEMENTS(plmTable); plmIdx++)
 +        {
 +            NvBool opened = NV_FALSE;
 +            for (attempt = 0; attempt < 2 && !opened; attempt++)
