@@ -14,6 +14,10 @@ TARBALL_URL="https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags
 KVER="$(uname -r)"
 KSRC="/lib/modules/${KVER}/build"
 INSTALL_MOD_DIR="/lib/modules/${KVER}/updates/cmpunlocker"
+# CMPUNLOCKER_BUILD_ONLY=<dir>: compile only, copy the .ko files to <dir>; never touches /lib/modules,
+# depmod or the initramfs, and does not need root. Install separately once the modules are tested.
+BUILD_ONLY_DIR="${CMPUNLOCKER_BUILD_ONLY:-}"
+[[ -n "${BUILD_ONLY_DIR}" ]] && INSTALL_MOD_DIR="${BUILD_ONLY_DIR}"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -35,7 +39,7 @@ version_supported() {
     return 1
 }
 
-[[ "${EUID}" -eq 0 ]] || die "Run as root: sudo ${SCRIPT_DIR}/build.sh"
+[[ -n "${BUILD_ONLY_DIR}" || "${EUID}" -eq 0 ]] || die "Run as root: sudo ${SCRIPT_DIR}/build.sh"
 [[ -n "${VERSION}" ]] || die "No driver version set (driver/VERSION empty and CMPUNLOCKER_DRIVER_VERSION unset)"
 version_supported "${VERSION}" || die "Unsupported driver version '${VERSION}' (supported: ${SUPPORTED_VERSIONS[*]})"
 [[ -d "${PATCH_DIR}" ]] || die "Missing patches directory: ${PATCH_DIR}"
@@ -191,7 +195,7 @@ else
     info "Reusing prior build output — incremental rebuild"
 fi
 
-JOBS="$(nproc)"
+JOBS="${CMPUNLOCKER_JOBS:-$(nproc)}"
 CC_CMD="gcc"
 if command -v ccache &>/dev/null; then
     CC_CMD="ccache gcc"
@@ -199,6 +203,11 @@ if command -v ccache &>/dev/null; then
 fi
 make -j"${JOBS}" modules SYSSRC="${KSRC}" CC="${CC_CMD}"
 ok "Modules built"
+if [[ -n "${BUILD_ONLY_DIR}" ]]; then
+    find "${SRC_DIR}" -type f -name 'nvidia*.ko' ! -path '*/conftest/*' -exec cp {} "${BUILD_ONLY_DIR}/" \;
+    ok "Build-only: modules copied to ${BUILD_ONLY_DIR} (NOT installed)"
+    exit 0
+fi
 if command -v ccache &>/dev/null; then
     ccache -s 2>/dev/null | sed 's/^/  /' || true
 fi
