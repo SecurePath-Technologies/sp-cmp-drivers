@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+"""sp-power: the ONE power / clock / fan / thermal manager on sp-ai01 (2026-11-05).
+
+Replaces: cpu-powercap, quiet-power, quiet-fans, sp-cmp-powercap, sp-cmp-thermal-watchdog,
+sp-cmp-safe-boot, sp-cmp-perf-profile(.timer), sp-cmp-perf-stable(.timer), sp-cmp-clock-governor,
+170tune-persist, 170tune-bootcheck. Settings: /etc/sp-power.conf (reload: systemctl reload sp-power).
+
+What it owns (everything is re-checked every SLOW_S seconds and re-applied if something changed it):
+  CPU      turbo off; RAPL package caps (long + short term) CPU0_W / CPU1_W.
+           Socket >= CPU_HOT_C -> that socket's cap drops to CPU_HOT_PCT % until < CPU_RESUME_C.
+           Thermal actions only ever LOWER a cap.
+  CMP      every CMP 170HX (found by PCI ID, not index/address):
+           power limit CMP_POWER_W; core or HBM >= CMP_HOT_C -> CMP_HOT_W until < CMP_RESUME_C.
+           Boot stages: 'safe' (CMP_SAFE_OFFSET, clocks <= CMP_SAFE_CLK) from boot; at uptime
+           CMP_PERF_AFTER_S -> 'perf' (CMP_PERF_OFFSET, <= CMP_PERF_CLK) unless the boot-loop guard
+           tripped. Guard (same marker files as the old sp-cmp-perf-profile.sh, /var/lib/sp-cmp-perf):
+           'armed' is written before perf is applied and removed at uptime CMP_STABLE_AFTER_S; finding
+           it at the next perf decision means that boot died -> 'tripped', stay safe until
+           `sp-power reset-perf`.
+           Clock governor: any CMP busy (> CMP_UTIL_ON %) -> SM floor CMP_BOOST_FLOOR on all CMPs;
+           idle CMP_HOLD_S s -> CMP_IDLE_FLOOR; core/HBM >= CMP_SOFT_C releases the floor until < CMP_SOFT_RESUME_C.
+  Fans     every NVIDIA GPU that has its own fan: FAN_IDLE_PCT % while quiet, driver auto curve when
+           that GPU >= FAN_HOT_GPU_C or >= FAN_HOT_GPU_W, or the hottest CPU >= FAN_HOT_CPU_C.
+           Chassis fans are not controllable (BMC/EC follow CPU temp only).
+  PSU      logged when a PSU sensor >= PSU_LIMIT_C (ipmitool, every PSU_LOG_S s).
+On stop/crash: GPU fans go back to auto and the CMP clock floor is released. Caps stay at their last values.
+
+CLI:  sp-power status | sp-power reset-perf | sp-power run [--dry-run]
+"""
+import ctypes as C
+import glob
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+CONF = "/etc/sp-power.conf"
+RUN = "/run/sp-power"
+STATE = RUN + "/state.json"
+STAGE = RUN + "/stage.json"          # survives daemon restarts within one boot, not reboots
+GUARD = "/var/lib/sp-cmp-perf"
+ARMED, TRIPPED = GUARD + "/armed", GUARD + "/tripped"
+NVML_OC = "/usr/local/bin/nvml_oc"
+CMP_IDS = (0x20C2, 0x2082, 0x20B0)
+
+DEFAULTS = dict(
+    CPU_NO_TURBO=1, CPU0_W=50, CPU1_W=85, CPU_HOT_C=85, CPU_RESUME_C=78, CPU_HOT_PCT=75,
+    CMP_POWER_W=165, CMP_HOT_C=83, CMP_RESUME_C=75, CMP_HOT_W=125,
+    CMP_SAFE_OFFSET=0, CMP_SAFE_CLK=1200, CMP_PERF_OFFSET=150, CMP_PERF_CLK=1695,
+    CMP_PERF_AFTER_S=300, CMP_STABLE_AFTER_S=2100,
+    CMP_BOOST_FLOOR=1600, CMP_IDLE_FLOOR=210, CMP_UTIL_ON=5, CMP_HOLD_S=30,
+    CMP_SOFT_C=78, CMP_SOFT_RESUME_C=73,
+    FAN_IDLE_PCT=30, FAN_HOT_GPU_C=62, FAN_HOT_GPU_W=80, FAN_HOT_CPU_C=75,
+    FAST_S=0.25, SLOW_S=5, REASSERT_S=60, PSU_LOG_S=60, PSU_LIMIT_C=80,
+)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def load_conf():
+    c = dict(DEFAULTS)
+    try:
+        for line in open(CONF):
+            line = line.split("#", 1)[0].strip()
+            if "=" not in line:
+                continue
+            k, v = (s.strip().strip('"') for s in line.split("=", 1))
+            if k in DEFAULTS and v != "":
+                c[k] = type(DEFAULTS[k])(float(v)) if isinstance(DEFAULTS[k], int) else float(v)
+            elif k not in DEFAULTS:
+                log(f"config: unknown key {k} ignored")
+    except FileNotFoundError:
+        log(f"config: {CONF} missing, using built-in defaults")
+    return c
+
+
+def uptime():
+    return float(open("/proc/uptime").read().split()[0])
+
+
+def rd(path, default=None):
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return default
+
+
+# ---------------------------------------------------------------- NVML
+class PciInfo(C.Structure):
+    _fields_ = [("busIdLegacy", C.c_char * 16), ("domain", C.c_uint), ("bus", C.c_uint),
+                ("device", C.c_uint), ("pciDeviceId", C.c_uint), ("pciSubSystemId", C.c_uint),
+                ("busId", C.c_char * 32)]
+
+
+class FieldValue(C.Structure):
+    _fields_ = [("fieldId", C.c_uint), ("scopeId", C.c_uint), ("timestamp", C.c_longlong),
+                ("latencyUsec", C.c_longlong), ("valueType", C.c_int), ("nvmlReturn", C.c_int),
+                ("value", C.c_ulonglong)]
+
+
+class Util(C.Structure):
+    _fields_ = [("gpu", C.c_uint), ("memory", C.c_uint)]
+
+
+FI_MEMORY_TEMP = 82
+
+
+class Gpu:
+    def __init__(self, nv, idx, h):
+        self.nv, self.idx, self.h = nv, idx, h
+        name = C.create_string_buffer(96)
+        nv.nvmlDeviceGetName(h, name, 96)
+        self.name = name.value.decode(errors="replace")
+        pci = PciInfo()
+        nv.nvmlDeviceGetPciInfo_v3(h, C.byref(pci))
+        self.bus = pci.busId.decode().lower()
+        self.devid = pci.pciDeviceId >> 16
+        self.cmp = self.devid in CMP_IDS or "CMP 170HX" in self.name
+        n = C.c_uint(0)
+        self.fans = n.value if nv.nvmlDeviceGetNumFans(h, C.byref(n)) == 0 else 0
+        # runtime state
+        self.hot = False          # hard thermal cap active (CMP)
+        self.fan_auto = None      # None = not yet set
+        self.t = self.hbm = self.w = self.util = None
+
+    def read(self):
+        nv, h = self.nv, self.h
+        t, p, u = C.c_uint(), C.c_uint(), Util()
+        self.t = t.value if nv.nvmlDeviceGetTemperature(h, 0, C.byref(t)) == 0 else None
+        self.w = p.value / 1000 if nv.nvmlDeviceGetPowerUsage(h, C.byref(p)) == 0 else None
+        self.util = u.gpu if nv.nvmlDeviceGetUtilizationRates(h, C.byref(u)) == 0 else None
+        self.hbm = None
+        if self.cmp:
+            f = FieldValue(fieldId=FI_MEMORY_TEMP)
+            if nv.nvmlDeviceGetFieldValues(h, 1, C.byref(f)) == 0 and f.nvmlReturn == 0 and f.value:
+                self.hbm = int(f.value)
+        return self
+
+    def hottest(self):
+        return max(x for x in (self.t, self.hbm, 0) if x is not None)
+
+    def power_limit(self):
+        v = C.c_uint()
+        return v.value // 1000 if self.nv.nvmlDeviceGetPowerManagementLimit(self.h, C.byref(v)) == 0 else None
+
+
+# ---------------------------------------------------------------- daemon
+class SpPower:
+    def __init__(self, dry=False):
+        self.dry = dry
+        self.c = load_conf()
+        self.nv = None
+        self.gpus = []
+        self.gpu_count = -1
+        self.last_enum = 0
+        self.cpu_hot = {}
+        self.cpu_temp = {}
+        self.clk = None           # (floor, ceiling) last applied to CMPs
+        self.clk_at = 0
+        self.boosted = self.soft_hot = False
+        self.last_busy = 0
+        self.fan_at = 0
+        self.psu_at = 0
+        self.failed = set()       # rate-limit repeated failure logs
+        self.st = self.load_stage()
+        self.reload = False
+        self.stop = False
+
+    # --- helpers
+    def act(self, what, fn):
+        if self.dry:
+            log(f"DRY: {what}")
+            return True
+        try:
+            ok = fn()
+        except Exception as e:  # noqa: BLE001
+            ok, what = False, f"{what} ({e})"
+        if ok is False:
+            if what not in self.failed:
+                log(f"FAILED: {what}")
+                self.failed.add(what)
+            return False
+        self.failed.discard(what)
+        return True
+
+    def wr(self, path, val):
+        with open(path, "w") as f:
+            f.write(str(val))
+
+    def load_stage(self):
+        try:
+            return json.load(open(STAGE))
+        except (OSError, ValueError):
+            return {"stage": "safe", "decided": False, "reason": "boot", "stable": False, "applied": None}
+
+    def save_stage(self):
+        if self.dry:
+            return
+        os.makedirs(RUN, exist_ok=True)
+        json.dump(self.st, open(STAGE + ".tmp", "w"))
+        os.replace(STAGE + ".tmp", STAGE)
+
+    # --- NVML / GPU discovery
+    def nvml(self):
+        if self.nv is None:
+            try:
+                nv = C.CDLL("libnvidia-ml.so.1")
+                if nv.nvmlInit_v2() != 0:
+                    return False
+                self.nv = nv
+                log("NVML up")
+            except OSError:
+                return False
+        now = time.monotonic()
+        if now - self.last_enum >= 60 or self.gpu_count < 0:
+            self.last_enum = now
+            n = C.c_uint()
+            if self.nv.nvmlDeviceGetCount_v2(C.byref(n)) != 0:
+                return False
+            if n.value != self.gpu_count:
+                old = {g.bus: g for g in self.gpus}
+                gpus = []
+                for i in range(n.value):
+                    h = C.c_void_p()
+                    if self.nv.nvmlDeviceGetHandleByIndex_v2(i, C.byref(h)) == 0:
+                        g = Gpu(self.nv, i, h)
+                        if g.bus in old:   # keep runtime state across re-enumeration
+                            o = old[g.bus]
+                            g.hot, g.fan_auto = o.hot, o.fan_auto
+                        gpus.append(g)
+                self.gpus, self.gpu_count = gpus, n.value
+                self.clk = None
+                self.st["applied"] = None   # re-apply stage offsets to (possibly new) CMPs
+                log("GPUs: " + ", ".join(f"{g.idx}={g.bus[-12:]} {g.name}{' [CMP]' if g.cmp else ''}"
+                                         f"{' fans=%d' % g.fans if g.fans else ''}" for g in gpus))
+        return True
+
+    def cmps(self):
+        return [g for g in self.gpus if g.cmp]
+
+    # --- CPU
+    def rapl_zone(self, pkg):
+        for z in glob.glob("/sys/class/powercap/intel-rapl:*"):
+            if z.count(":") == 1 and rd(z + "/name") == f"package-{pkg}":
+                return z
+        return None
+
+    def cpu_temps(self):
+        temps = {}
+        for h in glob.glob("/sys/class/hwmon/hwmon*"):
+            if rd(h + "/name") != "coretemp":
+                continue
+            for lab in glob.glob(h + "/temp*_label"):
+                l = rd(lab, "")
+                if l.startswith("Package id "):
+                    v = rd(lab.replace("_label", "_input"))
+                    if v:
+                        temps[int(l.split()[-1])] = int(v) / 1000
+        return temps
+
+    def cpu_tick(self):
+        c = self.c
+        if c["CPU_NO_TURBO"]:
+            p = "/sys/devices/system/cpu/intel_pstate/no_turbo"
+            if rd(p) == "0":
+                self.act("turbo off", lambda: self.wr(p, 1))
+        self.cpu_temp = self.cpu_temps()
+        for pkg, base in ((0, c["CPU0_W"]), (1, c["CPU1_W"])):
+            z = self.rapl_zone(pkg)
+            if not z:
+                continue
+            t = self.cpu_temp.get(pkg)
+            hot = self.cpu_hot.get(pkg, False)
+            if t is not None:
+                if not hot and t >= c["CPU_HOT_C"]:
+                    hot = True
+                    log(f"CPU{pkg} {t:.0f} C >= {c['CPU_HOT_C']}: cap -> {base * c['CPU_HOT_PCT'] // 100} W")
+                elif hot and t < c["CPU_RESUME_C"]:
+                    hot = False
+                    log(f"CPU{pkg} cooled to {t:.0f} C: cap back to {base} W")
+            self.cpu_hot[pkg] = hot
+            want = (base * c["CPU_HOT_PCT"] // 100 if hot else base) * 1_000_000
+            if rd(z + "/enabled") == "0":
+                self.act(f"RAPL package-{pkg} enable", lambda z=z: self.wr(z + "/enabled", 1))
+            for k in (0, 1):
+                f = f"{z}/constraint_{k}_power_limit_uw"
+                cur = rd(f)
+                if cur is not None and int(cur) != want:
+                    hot_uw = base * c["CPU_HOT_PCT"] // 100 * 1_000_000
+                    if not hot and not self.dry and int(cur) != hot_uw:
+                        log(f"CPU{pkg} constraint_{k} was {int(cur) / 1e6:g} W (changed outside sp-power) -> {want / 1e6:g} W")
+                    self.act(f"CPU{pkg} constraint_{k} {want / 1e6:g} W", lambda f=f: self.wr(f, want))
+
+    # --- CMP boot stages + guard
+    def stage_tick(self):
+        c, st = self.c, self.st
+        up = uptime()
+        if not st["decided"] and up >= c["CMP_PERF_AFTER_S"]:
+            st["decided"] = True
+            if os.path.exists(TRIPPED):
+                st["reason"] = "guard tripped: " + (rd(TRIPPED) or "?") + " (sp-power reset-perf to re-enable)"
+                log("perf profile NOT applied, " + st["reason"])
+            elif os.path.exists(ARMED):
+                msg = f"previous boot died within {c['CMP_STABLE_AFTER_S'] // 60} min of applying the profile (armed {rd(ARMED)})"
+                if not self.dry:
+                    os.makedirs(GUARD, exist_ok=True)
+                    self.wr(TRIPPED, msg)
+                    os.remove(ARMED)
+                st["reason"] = "guard tripped now: " + msg
+                log("perf profile NOT applied, " + st["reason"])
+            elif not self.cmps():
+                st["decided"] = False      # no CMP yet; decide when one shows up
+            else:
+                if not self.dry:
+                    os.makedirs(GUARD, exist_ok=True)
+                    with open(ARMED, "w") as f:
+                        f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+                        f.flush()
+                        os.fsync(f.fileno())
+                st["stage"], st["reason"] = "perf", f"applied at uptime {up:.0f}s (guard armed)"
+                log("CMP perf profile: " + st["reason"])
+            self.save_stage()
+        if st["stage"] == "perf" and not st["stable"] and up >= c["CMP_STABLE_AFTER_S"]:
+            st["stable"] = True
+            if not self.dry and os.path.exists(ARMED):
+                os.remove(ARMED)
+            log("CMP perf profile ran without a crash; guard marker cleared")
+            self.save_stage()
+        # apply the stage's offset to every CMP once per (stage, CMP set)
+        key = [st["stage"], sorted(g.bus for g in self.cmps())]
+        if st["applied"] != key and self.cmps():
+            off = c["CMP_PERF_OFFSET"] if st["stage"] == "perf" else c["CMP_SAFE_OFFSET"]
+            ok = all(self.act(f"GPU{g.idx} clock offset {off:+d} MHz", lambda g=g: subprocess.run(
+                [NVML_OC, "-i", str(g.idx), str(off), "0"], capture_output=True, timeout=30).returncode == 0)
+                for g in self.cmps())
+            log(f"CMP stage '{st['stage']}': offset {off:+d} MHz, ceiling {self.ceiling()} MHz" + ("" if ok else " (offset FAILED)"))
+            st["applied"] = key
+            self.save_stage()
+
+    def ceiling(self):
+        return self.c["CMP_PERF_CLK"] if self.st["stage"] == "perf" else self.c["CMP_SAFE_CLK"]
+
+    # --- CMP clock governor + thermal (fast path)
+    def cmp_fast(self):
+        c = self.c
+        cmps = [g.read() for g in self.cmps()]
+        if not cmps:
+            return
+        now = time.monotonic()
+        t = max(g.hottest() for g in cmps)
+        if not self.soft_hot and t >= c["CMP_SOFT_C"]:
+            self.soft_hot = True
+            if self.boosted:
+                self.boosted = False
+                log(f"CMP {t} C >= {c['CMP_SOFT_C']}: clock floor released")
+        elif self.soft_hot and t < c["CMP_SOFT_RESUME_C"]:
+            self.soft_hot = False
+            log(f"CMP back to {t} C: boosting allowed")
+        if any(g.util is not None and g.util > c["CMP_UTIL_ON"] for g in cmps):
+            self.last_busy = now
+            if not self.boosted and not self.soft_hot:
+                self.boosted = True
+        if self.boosted and now - self.last_busy > c["CMP_HOLD_S"]:
+            self.boosted = False
+        ceil = self.ceiling()
+        floor = min(c["CMP_BOOST_FLOOR"] if self.boosted else c["CMP_IDLE_FLOOR"], ceil)
+        if self.clk != (floor, ceil) or now - self.clk_at >= c["REASSERT_S"]:
+            if self.clk != (floor, ceil):
+                log(f"CMP clocks {floor}-{ceil} MHz ({'busy' if self.boosted else 'idle'})")
+            for g in cmps:
+                self.act(f"GPU{g.idx} locked clocks {floor}-{ceil}",
+                         lambda g=g: self.nv.nvmlDeviceSetGpuLockedClocks(g.h, floor, ceil) == 0)
+            self.clk, self.clk_at = (floor, ceil), now
+        # hard thermal cap, per card
+        for g in cmps:
+            h = g.hottest()
+            if not g.hot and h >= c["CMP_HOT_C"]:
+                g.hot = True
+                log(f"GPU{g.idx} {h} C >= {c['CMP_HOT_C']}: power -> {c['CMP_HOT_W']} W")
+                self.cmp_power(g)
+            elif g.hot and h < c["CMP_RESUME_C"]:
+                g.hot = False
+                log(f"GPU{g.idx} cooled to {h} C: power back to {c['CMP_POWER_W']} W")
+                self.cmp_power(g)
+
+    def cmp_power(self, g):
+        want = self.c["CMP_HOT_W"] if g.hot else self.c["CMP_POWER_W"]
+        cur = g.power_limit()
+        if cur is not None and cur != want:
+            if not g.hot and not self.dry and cur != self.c["CMP_HOT_W"]:
+                log(f"GPU{g.idx} power limit was {cur} W (changed outside sp-power) -> {want} W")
+            self.act(f"GPU{g.idx} power limit {want} W",
+                     lambda: self.nv.nvmlDeviceSetPowerManagementLimit(g.h, C.c_uint(int(want * 1000))) == 0)
+
+    # --- fans
+    def fan_tick(self):
+        c = self.c
+        cpu = max(self.cpu_temp.values(), default=0)
+        now = time.monotonic()
+        reassert = now - self.fan_at >= c["REASSERT_S"]
+        for g in self.gpus:
+            if not g.fans:
+                continue
+            if not g.cmp:
+                g.read()
+            hot = (g.t or 0) >= c["FAN_HOT_GPU_C"] or (g.w or 0) >= c["FAN_HOT_GPU_W"] or cpu >= c["FAN_HOT_CPU_C"]
+            if hot and g.fan_auto is not True:
+                self.fans_auto(g)
+                log(f"GPU{g.idx} fan auto (gpu {g.t} C {g.w or 0:.0f} W, cpu {cpu:.0f} C)")
+            elif not hot and (g.fan_auto is not False or reassert):
+                ok = all(self.act(f"GPU{g.idx} fan{f} {c['FAN_IDLE_PCT']}%",
+                                  lambda f=f: self.nv.nvmlDeviceSetFanControlPolicy(g.h, f, 1) == 0
+                                  and self.nv.nvmlDeviceSetFanSpeed_v2(g.h, f, c["FAN_IDLE_PCT"]) == 0)
+                         for f in range(g.fans))
+                if g.fan_auto is not False and ok:
+                    log(f"GPU{g.idx} fan {c['FAN_IDLE_PCT']}% (gpu {g.t} C {g.w or 0:.0f} W)")
+                g.fan_auto = False if ok else None
+        if reassert:
+            self.fan_at = now
+
+    def fans_auto(self, g):
+        for f in range(g.fans):
+            self.act(f"GPU{g.idx} fan{f} auto", lambda f=f: self.nv.nvmlDeviceSetDefaultFanSpeed_v2(g.h, f) == 0)
+        g.fan_auto = True
+
+    # --- PSU
+    def psu_tick(self):
+        try:
+            out = subprocess.run(["ipmitool", "sdr"], capture_output=True, text=True, timeout=20).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        hot = []
+        for line in out.splitlines():
+            p = [x.strip() for x in line.split("|")]
+            if len(p) >= 2 and p[0].startswith("PSU") and "_TMP" in p[0]:
+                try:
+                    v = float(p[1].split()[0])
+                except (ValueError, IndexError):
+                    continue
+                if v >= self.c["PSU_LIMIT_C"]:
+                    hot.append(f"{p[0]}={v:.0f}C")
+        if hot:
+            log(f"PSU over {self.c['PSU_LIMIT_C']} C: {' '.join(hot)} (total draw: reduce load)")
+
+    # --- state for `sp-power status`
+    def write_state(self):
+        s = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "uptime_s": int(uptime()), "dry_run": self.dry,
+             "cmp_stage": self.st, "guard": {"armed": rd(ARMED), "tripped": rd(TRIPPED)},
+             "cpu": {}, "gpus": [], "cmp_clocks": self.clk, "cmp_boosted": self.boosted, "cmp_soft_hot": self.soft_hot}
+        for pkg in (0, 1):
+            z = self.rapl_zone(pkg)
+            s["cpu"][f"CPU{pkg}"] = {"temp_c": self.cpu_temp.get(pkg), "hot": self.cpu_hot.get(pkg, False),
+                                     "cap_w": int(rd(z + "/constraint_0_power_limit_uw", 0)) / 1e6 if z else None}
+        s["cpu"]["no_turbo"] = rd("/sys/devices/system/cpu/intel_pstate/no_turbo")
+        for g in self.gpus:
+            if not g.cmp and not g.fans:
+                g.read()
+            s["gpus"].append({"idx": g.idx, "bus": g.bus, "name": g.name, "cmp": g.cmp, "temp_c": g.t,
+                              "hbm_c": g.hbm, "power_w": g.w, "limit_w": g.power_limit(), "util": g.util,
+                              "hot": g.hot, "fans": g.fans, "fan_auto": g.fan_auto})
+        if self.dry:
+            return
+        os.makedirs(RUN, exist_ok=True)
+        json.dump(s, open(STATE + ".tmp", "w"), indent=1)
+        os.replace(STATE + ".tmp", STATE)
+
+    # --- main loop
+    def shutdown(self):
+        log("stopping: GPU fans -> auto, CMP clock floor released")
+        for g in self.gpus:
+            if g.fans:
+                self.fans_auto(g)
+        for g in self.cmps():
+            self.act(f"GPU{g.idx} clocks release", lambda g=g: self.nv.nvmlDeviceSetGpuLockedClocks(
+                g.h, self.c["CMP_IDLE_FLOOR"], self.ceiling()) == 0)
+
+    def run(self):
+        signal.signal(signal.SIGTERM, lambda *a: setattr(self, "stop", True))
+        signal.signal(signal.SIGINT, lambda *a: setattr(self, "stop", True))
+        signal.signal(signal.SIGHUP, lambda *a: setattr(self, "reload", True))
+        c = self.c
+        log(f"sp-power started{' (DRY RUN)' if self.dry else ''}: CPU0 {c['CPU0_W']} W, CPU1 {c['CPU1_W']} W, "
+            f"CMP {c['CMP_POWER_W']} W, stage '{self.st['stage']}'")
+        slow_at = 0.0
+        try:
+            while not self.stop:
+                if self.reload:
+                    self.reload = False
+                    self.c = c = load_conf()
+                    self.clk, self.fan_at, self.st["applied"] = None, 0, None
+                    log("config reloaded")
+                now = time.monotonic()
+                gpu_ok = False
+                try:
+                    gpu_ok = self.nvml()
+                    if gpu_ok:
+                        self.cmp_fast()
+                except Exception as e:  # noqa: BLE001  (never let a GPU glitch stop CPU management)
+                    log(f"GPU fast path error: {e}")
+                if now - slow_at >= c["SLOW_S"]:
+                    slow_at = now
+                    self.cpu_tick()
+                    if gpu_ok:
+                        try:
+                            self.stage_tick()
+                            for g in self.cmps():
+                                self.cmp_power(g)
+                            self.fan_tick()
+                        except Exception as e:  # noqa: BLE001
+                            log(f"GPU slow path error: {e}")
+                    if now - self.psu_at >= c["PSU_LOG_S"]:
+                        self.psu_at = now
+                        self.psu_tick()
+                    self.write_state()
+                time.sleep(c["FAST_S"])
+        finally:
+            if self.nv is not None:
+                self.shutdown()
+
+
+def status():
+    try:
+        s = json.load(open(STATE))
+    except (OSError, ValueError):
+        print("no state (is sp-power running?  systemctl status sp-power)")
+        return 1
+    st = s["cmp_stage"]
+    print(f"sp-power  {s['time']}  uptime {s['uptime_s'] // 60} min")
+    for k, v in s["cpu"].items():
+        if isinstance(v, dict):
+            print(f"  {k}: {v['temp_c']} C  cap {v['cap_w']} W{'  HOT' if v['hot'] else ''}")
+    print(f"  turbo off: {s['cpu']['no_turbo'] == '1'}")
+    print(f"  CMP stage: {st['stage']} ({st['reason']})  clocks {s['cmp_clocks']}  "
+          f"{'busy' if s['cmp_boosted'] else 'idle'}{'  SOFT-HOT' if s['cmp_soft_hot'] else ''}")
+    if s["guard"]["tripped"]:
+        print(f"  guard TRIPPED: {s['guard']['tripped']}  -> sp-power reset-perf")
+    for g in s["gpus"]:
+        fan = "" if not g["fans"] else f"  fan {'auto' if g['fan_auto'] else 'quiet'}"
+        hbm = f"/{g['hbm_c']}" if g["hbm_c"] else ""
+        print(f"  GPU{g['idx']} {g['bus'][-12:]} {g['name']}: {g['temp_c']}{hbm} C  {g['power_w'] or 0:.0f}/{g['limit_w']} W"
+              f"  util {g['util']}%{'  HOT' if g['hot'] else ''}{fan}")
+    return 0
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "run":
+        SpPower(dry="--dry-run" in sys.argv).run()
+    elif cmd == "status":
+        sys.exit(status())
+    elif cmd == "reset-perf":
+        for f in (ARMED, TRIPPED):
+            if os.path.exists(f):
+                os.remove(f)
+        print("guard reset: the CMP perf profile will apply at the next boot (after CMP_PERF_AFTER_S).")
+        print("Make sure the perf values in /etc/sp-power.conf are qualified for the CMPs that are installed.")
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
