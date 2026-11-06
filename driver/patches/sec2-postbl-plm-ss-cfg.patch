@@ -66,7 +66,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
  
      {
          // If the new FB layout requires a scrubber ucode to scrub additional space, prepare it now
-@@ -4821,6 +4857,148 @@
+@@ -4821,6 +4857,151 @@
      // Setup arguments for bootstrapping GSP
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPrepareForBootstrap_HAL(pGpu, pKernelGsp, KGSP_BOOT_MODE_NORMAL));
  
@@ -94,6 +94,9 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +            { 0x009a3c7cU, 0xffffffffU, "FBPA_PLL0" },
 +            { 0x009a3c80U, 0xffffffffU, "FBPA_PLL1" },
 +            { 0x009a3c84U, 0xffffffffU, "FBPA_PLL2" },
++            // FBPA_MEM PLM (asm64-hooligan/cmpunlocker@overclock, PLM[2]): makes the HBM2e timing block
++            // (CONFIG0..4, 0x9a0290..) host-writable for 170tune timings/fbpa_regs. 2026-11-06.
++            { 0x009a0168U, 0xffffffffU, "FBPA_MEM" },
 +        };
 +
 +        NvU32 wpr2Lo = GPU_REG_RD32(pGpu, 0x001fa824U);

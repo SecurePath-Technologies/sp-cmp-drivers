@@ -19,6 +19,10 @@ What it owns (everything is re-checked every SLOW_S seconds and re-applied if so
            `sp-power reset-perf`.
            Clock governor: any CMP busy (> CMP_UTIL_ON %) -> SM floor CMP_BOOST_FLOOR on all CMPs;
            idle CMP_HOLD_S s -> CMP_IDLE_FLOOR; core/HBM >= CMP_SOFT_C releases the floor until < CMP_SOFT_RESUME_C.
+           HBM profile (perf stage only, same guard): on the CMP whose serial is CMP_HBM_SERIAL, write
+           CMP_HBM_TIMINGS ("FIELD cycles ...", fbpa_regs) and THEN the HBM clock CMP_HBM_NDIV (hbm_mclk) -
+           the order 170tune hbm-gate qualified it in. Needs the cmpunlocker FBPA_PLL + FBPA_MEM PLMs.
+           Volatile: the VBIOS stock comes back on every boot, so 'safe' is always stock HBM.
   Fans     every NVIDIA GPU that has its own fan: FAN_IDLE_PCT % while quiet, driver auto curve when
            that GPU >= FAN_HOT_GPU_C or >= FAN_HOT_GPU_W, or the hottest CPU >= FAN_HOT_CPU_C.
            Chassis fans are not controllable (BMC/EC follow CPU temp only).
@@ -43,6 +47,8 @@ STAGE = RUN + "/stage.json"          # survives daemon restarts within one boot,
 GUARD = "/var/lib/sp-cmp-perf"
 ARMED, TRIPPED = GUARD + "/armed", GUARD + "/tripped"
 NVML_OC = "/usr/local/bin/nvml_oc"
+HBM_MCLK = "/usr/local/bin/hbm_mclk"
+FBPA_REGS = "/usr/local/bin/fbpa_regs"
 CMP_IDS = (0x20C2, 0x2082, 0x20B0)
 
 DEFAULTS = dict(
@@ -52,6 +58,7 @@ DEFAULTS = dict(
     CMP_PERF_AFTER_S=300, CMP_STABLE_AFTER_S=2100,
     CMP_BOOST_FLOOR=1600, CMP_IDLE_FLOOR=210, CMP_UTIL_ON=5, CMP_HOLD_S=30,
     CMP_SOFT_C=78, CMP_SOFT_RESUME_C=73,
+    CMP_HBM_SERIAL="", CMP_HBM_NDIV=0, CMP_HBM_TIMINGS="",
     FAN_IDLE_PCT=30, FAN_HOT_GPU_C=62, FAN_HOT_GPU_W=80, FAN_HOT_CPU_C=75,
     FAST_S=0.25, SLOW_S=5, REASSERT_S=60, PSU_LOG_S=60, PSU_LIMIT_C=80,
 )
@@ -70,7 +77,10 @@ def load_conf():
                 continue
             k, v = (s.strip().strip('"') for s in line.split("=", 1))
             if k in DEFAULTS and v != "":
-                c[k] = type(DEFAULTS[k])(float(v)) if isinstance(DEFAULTS[k], int) else float(v)
+                if isinstance(DEFAULTS[k], str):
+                    c[k] = v
+                else:
+                    c[k] = type(DEFAULTS[k])(float(v)) if isinstance(DEFAULTS[k], int) else float(v)
             elif k not in DEFAULTS:
                 log(f"config: unknown key {k} ignored")
     except FileNotFoundError:
@@ -120,6 +130,8 @@ class Gpu:
         self.bus = pci.busId.decode().lower()
         self.devid = pci.pciDeviceId >> 16
         self.cmp = self.devid in CMP_IDS or "CMP 170HX" in self.name
+        ser = C.create_string_buffer(32)
+        self.serial = ser.value.decode(errors="replace") if nv.nvmlDeviceGetSerial(h, ser, 32) == 0 else ""
         n = C.c_uint(0)
         self.fans = n.value if nv.nvmlDeviceGetNumFans(h, C.byref(n)) == 0 else 0
         # runtime state
@@ -338,8 +350,30 @@ class SpPower:
                 [NVML_OC, "-i", str(g.idx), str(off), "0"], capture_output=True, timeout=30).returncode == 0)
                 for g in self.cmps())
             log(f"CMP stage '{st['stage']}': offset {off:+d} MHz, ceiling {self.ceiling()} MHz" + ("" if ok else " (offset FAILED)"))
+            if st["stage"] == "perf":
+                for g in self.cmps():
+                    self.hbm_apply(g)
             st["applied"] = key
             self.save_stage()
+
+    def hbm_apply(self, g):
+        c = self.c
+        if not c["CMP_HBM_NDIV"] or g.serial != c["CMP_HBM_SERIAL"]:
+            return
+        bdf = g.bus[-12:]
+        tok = c["CMP_HBM_TIMINGS"].split()
+        pairs = list(zip(tok[0::2], tok[1::2]))
+        def run(*a):
+            return subprocess.run(list(a), capture_output=True, text=True, timeout=30)
+        for f, v in pairs:   # timings FIRST (loosened for the higher clock), then the clock
+            if not self.act(f"GPU{g.idx} HBM {f}={v}", lambda f=f, v=v: run(FBPA_REGS, "-b", bdf, "set", f, v).returncode == 0):
+                log(f"GPU{g.idx} HBM profile aborted (timing {f} did not stick); clock left at stock")
+                return
+        n = c["CMP_HBM_NDIV"]
+        ok = self.act(f"GPU{g.idx} HBM NDIV {n}", lambda: run(HBM_MCLK, "-b", bdf, "set", str(n)).returncode == 0)
+        got = run(HBM_MCLK, "-b", bdf, "get").stdout if not self.dry else ""
+        log(f"GPU{g.idx} HBM profile: NDIV {n} ({n * 27} MHz), {len(pairs)} timings" + ("" if ok else " (clock FAILED)")
+            + (f" | {got.strip()}" if got else ""))
 
     def ceiling(self):
         return self.c["CMP_PERF_CLK"] if self.st["stage"] == "perf" else self.c["CMP_SAFE_CLK"]
