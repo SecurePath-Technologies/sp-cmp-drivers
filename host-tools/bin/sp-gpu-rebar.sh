@@ -1,10 +1,10 @@
 #!/bin/sh
 # BAR1 sizing for non-CMP NVIDIA GPUs, run by the modprobe hook BEFORE nvidia loads. Never fails.
 #  - BAR1 assigned by the firmware: try to grow it to the largest supported size.
-#  - BAR1 left UNASSIGNED by the firmware (not enough PCI address space, e.g. since 2026-11-05 both
-#    RTX PROs share root complex 3a, whose 64 GB window can't hold 2x 32 GB BAR1 + BAR3s): step the
-#    ReBAR size down via setpci and re-enumerate the card until the kernel can place it
-#    (3b lands at 8 GB). The card resets to 32 GB on every power cycle, so this runs every boot.
+#  - BAR1 left UNASSIGNED by the firmware (not enough PCI address space, e.g. two cards on one root
+#    complex whose 64 GB window can't hold 2x 32 GB BAR1 + BAR3s): step the ReBAR size down via setpci
+#    and re-enumerate the card until the kernel can place it. The card resets to its default size on
+#    every power cycle, so this runs every boot.
 # Runs from the initramfs: only shell builtins plus cat/sleep/setpci (setpci is added by dracut).
 log() { logger -t sp-gpu-rebar "$*" 2>/dev/null || echo "sp-gpu-rebar: $*" > /dev/kmsg 2>/dev/null; }
 is_cmp() { case "$(cat $1/device)" in 0x20c2|0x2082|0x20b0) return 0;; esac; return 1; }

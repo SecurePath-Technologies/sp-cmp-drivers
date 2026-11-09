@@ -1,7 +1,7 @@
 #!/bin/sh
 # Retrain each CMP 170HX link at Gen2 via its upstream bridge (LnkCtl2 target speed, LnkCtl retrain).
 # Only works once the patched nvidia driver is bound, so wait for that first (up to 90 s per card).
-for d in $(lspci -D -d 10de:20c2 | awk '{print $1}'); do
+for d in $(lspci -Dn | awk '$3 ~ /10de:(20c2|2082)/ {print $1}'); do
   p=/sys/bus/pci/devices/$d
   n=0; while [ ! -e $p/driver ] && [ $n -lt 90 ]; do sleep 1; n=$((n+1)); done
   [ -e $p/driver ] || { logger -t sp-cmp-gen2 "$d: no driver bound after 90 s; skipped"; continue; }

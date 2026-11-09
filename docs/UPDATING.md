@@ -13,7 +13,7 @@ NVIDIA tags each release at https://github.com/NVIDIA/open-gpu-kernel-modules/ta
    `CMPUNLOCKER_DRIVER_VERSION` set it builds the first entry).
 4. **Test build:** `CMPUNLOCKER_DRIVER_VERSION=<v> CMPUNLOCKER_BUILD_ONLY=$PWD/out CMPUNLOCKER_JOBS=4 driver/build.sh`.
 5. **Userspace must match:** the matching `nvidia-*-<branch>` userspace/firmware packages (incl. the GSP firmware) must
-   be installed at exactly the same version. On sp-ai01 these are apt-held; unhold, upgrade kernel + driver together.
+   be installed at exactly the same version. Holding them in apt is recommended; unhold, upgrade kernel + driver together.
 6. **Live test before install:** stop GPU users, `rmmod` the nvidia modules, `insmod` the built ones; check `dmesg` for
    `SEC2_DEBUG ... PLM` lines (no `FAILED to open`), expected memory size per card, and that non-CMP GPUs still work.
    Then install with `install.sh`, which also rebuilds the initramfs.

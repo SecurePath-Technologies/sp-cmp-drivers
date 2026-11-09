@@ -2,8 +2,8 @@
 Description=sp-power: CPU caps, CMP power/clocks/boot guard, GPU fans, thermal limits (one service; /etc/sp-power.conf)
 After=nvidia-persistenced.service sp-cmp-gen2.service
 Wants=nvidia-persistenced.service
-# The units it replaces; Conflicts= stops them if anything starts one again.
-Conflicts=cpu-powercap.service quiet-power.service quiet-fans.service sp-cmp-powercap.service sp-cmp-thermal-watchdog.service sp-cmp-safe-boot.service sp-cmp-perf-profile.service sp-cmp-perf-stable.service sp-cmp-clock-governor.service 170tune-persist.service 170tune-bootcheck.service sp-cmp-perf-profile.timer sp-cmp-perf-stable.timer
+# If other units on your host also set power limits, clocks or fans, list them here so they cannot fight it:
+# Conflicts=<unit> ...
 
 [Service]
 Type=simple

@@ -1,21 +1,26 @@
 #!/bin/bash
-# sp-ai01 GPU setup: fix driver load, ReBAR, patched 610 driver + CMP 170HX unlock
+# CMP 170HX host setup: fix driver load, ReBAR, patched 610 driver + CMP 170HX unlock
 # (64GB / FMA / Gen2), Gen2 link retrain, persistence. Idempotent: safe to re-run;
 # each step checks current state first and skips what is already done.
 #
-#   sudo ~/gpu-setup/sp-ai01-gpu.sh            # do everything
-#   sudo ~/gpu-setup/sp-ai01-gpu.sh --status   # report only, change nothing
+#   sudo ./cmp-host-setup.sh            # do everything
+#   sudo ./cmp-host-setup.sh --status   # report only, change nothing
 #
 # Also the "things got wonky" fixer: re-run it after a bad boot, a lost unlock, a stock driver
 # sneaking back in, or a link that fell to Gen1. Safe while models run: any step that has to
 # unload the driver stops and asks you to stop containers first; everything else applies live.
 #
-# Log: /var/log/sp-ai01-gpu.log   Backups of every file touched: /var/backups/sp-ai01-gpu/
+# Written for one research box (CMP 170HX + other NVIDIA GPUs on one patched driver); read each step before
+# running it elsewhere. Overrides: SRC, EXPECT_GPUS, CMP_CPUS/CMP_MEMS (see below).
+# Log: /var/log/cmp-host-setup.log   Backups of every file touched: /var/backups/cmp-host-setup/
 set -uo pipefail
 
-LOG=/var/log/sp-ai01-gpu.log
-BACKUP=/var/backups/sp-ai01-gpu/$(date +%Y%m%d-%H%M%S)
-SRC=/opt/sp-ai01-gpu                       # third-party repos land here
+LOG=/var/log/cmp-host-setup.log
+BACKUP=/var/backups/cmp-host-setup/$(date +%Y%m%d-%H%M%S)
+SRC=${SRC:-/opt/cmp-host}                 # third-party repos land here
+EXPECT_GPUS=${EXPECT_GPUS:-}              # optional: exact number of NVIDIA GPUs expected
+CMP_CPUS=${CMP_CPUS:-}                    # optional: CPU list local to the CMPs (for the pinning hint)
+CMP_MEMS=${CMP_MEMS:-}
 CMPUNLOCKER_REPO=https://github.com/amoghmunikote/cmpunlocker.git
 TUNE_REPO=https://github.com/cachenetics/170tune.git
 CMP_IDS='10de:(20c2|2082)'                # CMP 170HX: 20c2 = 8GB card (64 GB unlock), 2082 = 10GB card (40 GB)
@@ -38,17 +43,17 @@ vram_ok() { timeout 30 nvidia-smi --query-gpu=pci.bus_id,memory.total --format=c
             | awk -F', ' -v want="$(cmp_bdfs | sed 's/^0000://' | tr 'A-Z' 'a-z' | xargs)" \
               'BEGIN{t=split(want,w," ")} {b=tolower($1); for(i=1;i<=t;i++) if (index(b,w[i]) && $2 > 39000) n++} END{exit !(t>0 && n==t)}'; }
 bar1_mb()   { awk 'NR==2{s=strtonum($2)-strtonum($1); print (s>0)?int((s+1)/1048576):0}' /sys/bus/pci/devices/$1/resource; }
-# RTX PROs whose BAR1 is below 32 GB (ReBAR not applied; only a driver reload fixes it)
-# RTX PROs with BAR1 below 8 GB. Since 2026-11-05 both RTX PROs share root complex 3a (64 GB window), so 3b
-# can only get 8 GB (the rebar helper fits it at boot); 8 GB is normal, not a fault.
+# Non-CMP GPUs with BAR1 below 8 GB (ReBAR not applied; only a driver reload fixes it). Two large-BAR cards on one
+# root complex may not both fit at 32 GB (e.g. a 64 GB MMIO window); the rebar helper then fits one at a smaller
+# size, so 8 GB counts as normal, not a fault.
 small_bars() { local d; for d in $(nv_bdfs); do is_cmp_dev $d && continue
                [ "$(bar1_mb $d)" -lt 8192 ] && echo "$d"; done; }
 drv_of()    { local l=/sys/bus/pci/devices/$1/driver; [ -e "$l" ] && basename "$(readlink "$l")" || echo none; }
 # rmmod, not modprobe -r: after the 595 purge the loaded modules have no files on disk,
 # and modprobe -r silently fails on modules it cannot find in the index.
-# Host services that keep /dev/nvidia* open (quiet-fans holds an NVML handle on GPU0 all the time).
+# Host services that keep /dev/nvidia* open (anything holding an NVML handle, e.g. sp-power).
 # Stopped before an unload and started again on exit, even if a later step fails.
-GPU_SERVICES="quiet-fans.service nvidia-persistenced.service"
+GPU_SERVICES="${GPU_SERVICES:-sp-power.service nvidia-persistenced.service}"
 STOPPED_SVCS=
 unload_nvidia() {
   local m s
@@ -81,10 +86,9 @@ status() {
 [ "${1:-}" = "--status" ] && { status; exit 0; }
 
 say "Preflight"
-[ "$(nv_bdfs | wc -l)" -eq 4 ] || die "expected 4 NVIDIA GPUs, found $(nv_bdfs | wc -l)"
+[ -z "$EXPECT_GPUS" ] || [ "$(nv_bdfs | wc -l)" -eq "$EXPECT_GPUS" ] || die "expected $EXPECT_GPUS NVIDIA GPUs, found $(nv_bdfs | wc -l)"
 [ "$(cmp_bdfs | wc -l)" -ge 1 ] || die "no CMP 170HX on the bus"
-[ "$(cmp_bdfs | wc -l)" -eq 2 ] || warn "only $(cmp_bdfs | wc -l) CMP 170HX on the bus (slots 1/2 empty since the 2026-11-05 swap)"
-ok "4 NVIDIA GPUs present (2x CMP 170HX)"
+ok "$(nv_bdfs | wc -l) NVIDIA GPUs present ($(cmp_bdfs | wc -l)x CMP 170HX)"
 if [ -n "$(docker ps -q 2>/dev/null)" ]; then
   warn "containers running ($(docker ps --format '{{.Names}}' | xargs)): live fixes only; driver reloads will stop and ask"
 else ok "no containers running"; fi
@@ -95,17 +99,17 @@ if [ -d /sys/module/nvidia ]; then
   else warn "loaded nvidia module is NOT the patched cmpunlocker build; steps 5-6 will reinstall/reload it"; rm -f $SRC/.cmpunlocker-installed; fi
 else warn "nvidia driver not loaded; step 6 will load it"; fi
 
-# Some fixes only apply on a driver reload (ReBAR on the RTX PROs, a lost 64GB unlock). A reboot stops the
+# Some fixes only apply on a driver reload (ReBAR on non-CMP GPUs, a lost memory unlock). A reboot stops the
 # models anyway, so offer to do it here: stop the containers, let step 6 reload, restart them at the end.
 FORCE_RELOAD=; RESTART=
-STOPFILE=/run/sp-ai01-gpu.stopped-containers          # survives a killed run, not a reboot
+STOPFILE=/run/cmp-host-setup.stopped-containers          # survives a killed run, not a reboot
 [ -s $STOPFILE ] && { RESTART=$(cat $STOPFILE); warn "an earlier run stopped containers and did not restart them: $RESTART (restarted at the end)"; }
 restart_containers() {
   [ -n "$STOPPED_SVCS" ] && { systemctl start $STOPPED_SVCS && echo "   ok: restarted$STOPPED_SVCS" || echo "   WARN: could not restart$STOPPED_SVCS"; STOPPED_SVCS=; }
   [ -n "$RESTART" ] || return 0
   echo; echo "Restarting containers stopped for the driver reload: $RESTART"
-  docker start $RESTART >/dev/null && echo "   ok: started (models take a few minutes to load; then ~/check-bindings.sh)" \
-    || echo "   WARN: docker start failed; start them with ~/start-sm12x.sh, ~/start-gemma.sh, ~/start-ocr.sh"
+  docker start $RESTART >/dev/null && echo "   ok: started" \
+    || echo "   WARN: docker start failed; start them by hand: docker start $RESTART"
   RESTART=; rm -f $STOPFILE
 }
 trap restart_containers EXIT
@@ -125,8 +129,8 @@ if [ -n "$need" ]; then
   else warn "driver reload needed ($need) but containers are running; re-run from a terminal to be asked"; fi
 fi
 
-# --- 1. Remove the stale ReBAR-shrink hook (targets 0000:b4:00.0, which no longer exists).
-# It exits 1, and because modprobe.d chains it with '&&', nvidia never loads.
+# --- 1. Remove a stale ReBAR-shrink hook (one that targets a device which is no longer present).
+# If it exits 1 and modprobe.d chains it with '&&', nvidia never loads.
 say "1. Remove stale gpu-rebar-shrink hook"
 if [ -e /etc/modprobe.d/gpu-rebar-before-nvidia.conf ]; then
   backup /etc/modprobe.d/gpu-rebar-before-nvidia.conf
@@ -138,17 +142,17 @@ if [ -e /etc/systemd/system/gpu-rebar-shrink.service ]; then
   rm -f /etc/systemd/system/gpu-rebar-shrink.service; systemctl daemon-reload; ok "removed gpu-rebar-shrink.service"
 else skip "gpu-rebar-shrink.service already gone"; fi
 
-# --- 2. ReBAR: grow BAR1 on the RTX PRO 4500s to their max before nvidia binds.
+# --- 2. ReBAR: grow BAR1 on the non-CMP GPUs to their max before nvidia binds.
 # Non-fatal by design ('; modprobe', not '&&') so a failed resize can never block the driver again.
-say "2. ReBAR helper for RTX PRO 4500s"
+say "2. ReBAR helper for non-CMP GPUs"
 cat > /usr/local/sbin/sp-gpu-rebar.sh.new <<'EOF'
 #!/bin/sh
 # BAR1 sizing for non-CMP NVIDIA GPUs, run by the modprobe hook BEFORE nvidia loads. Never fails.
 #  - BAR1 assigned by the firmware: try to grow it to the largest supported size.
-#  - BAR1 left UNASSIGNED by the firmware (not enough PCI address space, e.g. since 2026-11-05 both
-#    RTX PROs share root complex 3a, whose 64 GB window can't hold 2x 32 GB BAR1 + BAR3s): step the
-#    ReBAR size down via setpci and re-enumerate the card until the kernel can place it
-#    (3b lands at 8 GB). The card resets to 32 GB on every power cycle, so this runs every boot.
+#  - BAR1 left UNASSIGNED by the firmware (not enough PCI address space, e.g. two cards on one root
+#    complex whose 64 GB window can't hold 2x 32 GB BAR1 + BAR3s): step the ReBAR size down via setpci
+#    and re-enumerate the card until the kernel can place it. The card resets to its default size on
+#    every power cycle, so this runs every boot.
 # Runs from the initramfs: only shell builtins plus cat/sleep/setpci (setpci is added by dracut).
 log() { logger -t sp-gpu-rebar "$*" 2>/dev/null || echo "sp-gpu-rebar: $*" > /dev/kmsg 2>/dev/null; }
 is_cmp() { case "$(cat $1/device)" in 0x20c2|0x2082|0x20b0) return 0;; esac; return 1; }
@@ -227,7 +231,7 @@ fi
 
 # --- 3. Kernel cmdline: iomem=relaxed lets 170tune write BAR0 from userspace. Needs a plain reboot to apply.
 say "3. Kernel cmdline"
-GD=/etc/default/grub.d/sp-ai01-gpu.cfg
+GD=/etc/default/grub.d/cmp-host.cfg
 WANT='GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT iomem=relaxed"'
 if [ "$(cat $GD 2>/dev/null)" != "$WANT" ]; then echo "$WANT" > $GD; update-grub >/dev/null 2>&1 && ok "added iomem=relaxed (applies next reboot)"
 else skip "iomem=relaxed already configured"; fi
@@ -259,7 +263,7 @@ say "5. cmpunlocker (patched 610 module, 64GB / FMA / Gen2 unlock)"
 mkdir -p $SRC
 [ -d $SRC/cmpunlocker/.git ] || git clone -q $CMPUNLOCKER_REPO $SRC/cmpunlocker || die "clone failed"
 # No auto-pull: a new upstream commit would rebuild and reload the driver under running models.
-# To upgrade on purpose: git -C /opt/sp-ai01-gpu/cmpunlocker pull, then re-run this script.
+# To upgrade on purpose: git -C $SRC/cmpunlocker pull, then re-run this script.
 REV=$(git -C $SRC/cmpunlocker rev-parse --short HEAD)
 KVER=$(modinfo -F version nvidia 2>/dev/null || true)
 if [ -f $SRC/.cmpunlocker-installed ] && [ "$(cat $SRC/.cmpunlocker-installed)" = "$REV $(uname -r) $USERVER" ] && [ "$KVER" = "$USERVER" ]; then
@@ -280,8 +284,8 @@ systemctl list-unit-files cmpunlocker.service >/dev/null 2>&1 && systemctl enabl
 # --- 6. Bring the cards up WITHOUT a power pull. Each CMP must be clean BEFORE nvidia initialises it:
 # GSP boot registers restored and, if the ACR version stamp is stuck (write-protected once set), a reset.
 # Not via cmpunlocker's passthrough.sh restore: that is for VM handoff. It loads nvidia partway through
-# its loop (so on 2026-09-25 af:00.0 was probed while still dirty and failed with Booter error 0x29),
-# then re-arms VM mode: persistence off and resets blocked, so our reset of af could not run.
+# its loop (a card can be probed while still dirty and fail with Booter error 0x29), then re-arms VM
+# mode: persistence off and resets blocked, so a follow-up reset cannot run.
 say "6. Load driver (clean CMP GSP state, no power cycle)"
 GSP_RESTORE=/usr/local/lib/cmpunlocker/gsp-restore
 cmp_clean() {   # $1 = CMP BDF, not bound to any driver
@@ -329,8 +333,8 @@ done
 
 # --- 7. PCIe Gen2 on the CMPs. The link can only train at Gen2 AFTER the patched driver loads: before
 # that the card advertises Gen1 only (LnkCap2 0x2; the driver sets 0x6). cmpunlocker's gen2.service
-# runs at sysinit, before the driver, so it never succeeds (600 attempts, then a 45 s timeout on the
-# 2026-09-25 boot). Ours runs after the driver is bound; it is what reached Gen2 on 2026-09-24.
+# runs at sysinit, before the driver, so it never succeeds (it retries, then times out and delays boot).
+# This one runs after the driver is bound, which is what reaches Gen2.
 say "7. PCIe Gen2"
 if systemctl is-enabled --quiet gen2.service 2>/dev/null; then
   systemctl disable gen2.service >/dev/null 2>&1 && ok "disabled cmpunlocker gen2.service (runs before the driver, cannot reach Gen2)"
@@ -410,7 +414,8 @@ off=$(nvidia-smi --query-gpu=index,persistence_mode --format=csv,noheader 2>/dev
 if [ -n "$off" ]; then nvidia-smi -pm 1 >/dev/null 2>&1; ok "persistence mode turned on for GPU(s) $off"
 else skip "persistence mode on for all GPUs"; fi
 
-# --- 8a. cmpunlocker's VM-passthrough arming turns CMP persistence off every boot. No VMs here, so disable it.
+# --- 8a. cmpunlocker's VM-passthrough arming turns CMP persistence off every boot. Disabled here (bare-metal use;
+# keep it if you pass the CMPs to a VM).
 say "8a. Disable cmpunlocker VM-passthrough arming"
 if systemctl is-enabled --quiet cmpunlocker-passthrough.service 2>/dev/null; then
   systemctl disable cmpunlocker-passthrough.service >/dev/null 2>&1 && ok "disabled cmpunlocker-passthrough.service (takes effect next boot)"
@@ -453,11 +458,8 @@ cat <<EOF
 
 Done. Re-run any time; finished steps are skipped.  Log: $LOG
 EOF
-[ -z "$RESTART" ] && [ -z "$(docker ps -q 2>/dev/null)" ] && echo "No containers running. Start them with ~/start-sm12x.sh, ~/start-gemma.sh, ~/start-ocr.sh."
-node1_mb=$(awk '/MemTotal/ {print int($4/1024)}' /sys/devices/system/node/node1/meminfo 2>/dev/null)
-if [ "${node1_mb:-0}" -gt 0 ]; then
-  echo "CMP workloads: pin to CPU socket 1 with --cpuset-cpus 8-15,24-31 --cpuset-mems 1 (node 1 has ${node1_mb} MB RAM)."
+if [ -n "$CMP_CPUS" ]; then
+  echo "CMP workloads: pin host threads near the CMPs: --cpuset-cpus $CMP_CPUS${CMP_MEMS:+ --cpuset-mems $CMP_MEMS} (see cmp-pin.sh)."
 else
-  echo "CMP workloads: pin to CPU socket 1 with --cpuset-cpus 8-15,24-31 (node 1 has no RAM,"
-  echo "so memory will still come from socket 0)."
+  echo "CMP workloads: pin host threads to the CPU socket the CMPs hang off (lspci -vv: NUMA node; see cmp-pin.sh)."
 fi

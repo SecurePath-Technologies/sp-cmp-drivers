@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""sp-power: the ONE power / clock / fan / thermal manager on sp-ai01 (2026-11-05).
+"""sp-power: one power / clock / fan / thermal manager for a CMP 170HX research host.
 
-Replaces: cpu-powercap, quiet-power, quiet-fans, sp-cmp-powercap, sp-cmp-thermal-watchdog,
-sp-cmp-safe-boot, sp-cmp-perf-profile(.timer), sp-cmp-perf-stable(.timer), sp-cmp-clock-governor,
-170tune-persist, 170tune-bootcheck. Settings: /etc/sp-power.conf (reload: systemctl reload sp-power).
+One daemon instead of a pile of single-purpose units (RAPL caps, GPU power caps, thermal watchdogs, boot-stage
+clock profiles, a clock governor, fan quieting). Settings: /etc/sp-power.conf (reload: systemctl reload sp-power).
+EXPERIMENTAL: overclock/HBM settings are research values; qualify them per card before relying on them.
 
 What it owns (everything is re-checked every SLOW_S seconds and re-applied if something changed it):
   CPU      turbo off; RAPL package caps (long + short term) CPU0_W / CPU1_W.
@@ -13,7 +13,7 @@ What it owns (everything is re-checked every SLOW_S seconds and re-applied if so
            power limit CMP_POWER_W; core or HBM >= CMP_HOT_C -> CMP_HOT_W until < CMP_RESUME_C.
            Boot stages: 'safe' (CMP_SAFE_OFFSET, clocks <= CMP_SAFE_CLK) from boot; at uptime
            CMP_PERF_AFTER_S -> 'perf' (CMP_PERF_OFFSET, <= CMP_PERF_CLK) unless the boot-loop guard
-           tripped. Guard (same marker files as the old sp-cmp-perf-profile.sh, /var/lib/sp-cmp-perf):
+           tripped. Guard (marker files in /var/lib/sp-cmp-perf):
            'armed' is written before perf is applied and removed at uptime CMP_STABLE_AFTER_S; finding
            it at the next perf decision means that boot died -> 'tripped', stay safe until
            `sp-power reset-perf`.
@@ -25,7 +25,7 @@ What it owns (everything is re-checked every SLOW_S seconds and re-applied if so
            Volatile: the VBIOS stock comes back on every boot, so 'safe' is always stock HBM.
   Fans     every NVIDIA GPU that has its own fan: FAN_IDLE_PCT % while quiet, driver auto curve when
            that GPU >= FAN_HOT_GPU_C or >= FAN_HOT_GPU_W, or the hottest CPU >= FAN_HOT_CPU_C.
-           Chassis fans are not controllable (BMC/EC follow CPU temp only).
+           Chassis fans are out of scope (on many servers the BMC/EC follows CPU temperature only).
   PSU      logged when a PSU sensor >= PSU_LIMIT_C (ipmitool, every PSU_LOG_S s).
 On stop/crash: GPU fans go back to auto and the CMP clock floor is released. Caps stay at their last values.
 
